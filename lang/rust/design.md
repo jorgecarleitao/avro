@@ -2,50 +2,133 @@
 
 This is a proposal to redesign the `avro` crate with performance in mind.
 
+This design is motivated by the design outlined [here](https://github.com/jorgecarleitao/arrow2/blob/main/src/io/README.md).
+
 ## Goals
 
-The goal of the `avro` crate is to offer a sound implementation of avro format.
+The goal of the `avro` crate is to offer a sound and fast implementation of avro format in Rust.
 
 Non-goals:
 
 * interoperate with other storage formats (e.g. json, parquet, csv)
-* interoperate with other in-memory formats (e.g. arrow, numpy)
+* interoperate with other in-memory formats (e.g. arrow, numpy, `serde-json`)
 
 ## Design
 
-### In-memory format
+### In-memory schema format
 
-For the crate to be useful, we need to commit to an in-memory format, so that users can e.g. read an avro file.
-There are two main options: an `enum` and a trait object.
+In-memory schema format refers to the specific structs and/or enums that declare a deserialized an avro schema.
+Avro (and many other formats) have two distinct meta types:
 
-In Rust, there are two main "types" to store a value: owning and non-owning (a ref with a lifetime). We support both.
-We use two different `enum`s: 
+* Logical types
+* Physical types
+
+Logical types have a many to one relationship with physical types, as defined [in the spec](https://avro.apache.org/docs/current/spec.html).
+
+The proposal is to declare the types as
 
 ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LogicalType {
+    Float,
+    Double,
+    String,
+    UUID,
+    ...
+    Enum(Box<Enum>), // Enum is a struct containing all required fields; `Box` reduces the size of `LogicalType`
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhysicalType {
+    Float,
+    Double,
+    String,
+    Bytes,
+    ...
+}
+
+impl LogicalType {
+    // the physical type associated to the logical type
+    pub fn physical_type(&self) -> PhysicalType;
+}
+
+// support to read and write to json corresponding exactly to the schema definitions in avro, since the spec _is_ json.
+impl Serialize for LogicalType {...};
+impl Serialize for PhysicalType {...};
+```
+
+The background for this is that it allow users to more easily write schemas as well as using `match`.
+
+### In-memory data format
+
+In-memory data format in this context refers to the specific structs and/or enum that
+declare a deserialized row. Formally, it is the physical layout of the data.
+Because avro is not an in-memory format, the particular format we use is not part of
+the spec but merely a tool to be able to use avro from Rust.
+
+There are two main options: an `enum` and a trait object. We use an `enum`s:
+
+```rust
 pub enum Value {
-    ...
-}
-
-pub enum ValueRef<'a> {
-    ...
-}
-
-impl ValueRef {
-    /// converts itself to the owned version of [`ValueRef`]
-    pub fn to_owned(&self) -> Value;
+    Float(f64),
+    Int(i64),
+    String(String),
+    UUID(String),
+    Bytes(Vec<u8>),
+    Array(Vec<Value>),
 }
 ```
 
-the first one owns the data (e.g. `Value::String(String)`), the second one owns a non-mutable reference of the data `Value::String(&str)`.
+An alternative implementation is to use 
+
+```rust
+pub enum Value {
+    Float(f64),
+    Int(i64),
+    String(String, LogicalType),
+    Bytes(Vec<u8>),
+}
+```
+
+i.e. enumerate physical types and attached logical types to derive logic-specific
+semantics to the consumers. This has the advantage of allowing functionality specific
+to a physical type to be `matched` using `Value::String(v, _)`.
+
+Note that this is a row-based representation (i.e. `Value` represents a single row).
+This choice is driven by the format being row-based.
+
+Note that this declaration is _not_ suitable for consumption by other formats. Specifically,
+
+```
+block -> Value -> target in-memory format
+```
+
+incurs an allocation per item for every non-copy type (e.g. `String`). This scales
+with the number of items times the number of nodes, which is expensive. For this reason,
+we _must_ expose, as part of the API, interfaces that allow to deserialize from avro
+without commiting to `Value` (see below).
 
 ### CPU and IO
 
-We divide the operations that are CPU-bounded from operations that are IO-bounded.
-They can be distinguished by whether there is `R: Read` as a generic parameter, which denotes IO-bounded ops.
+Reading a file is usually composed by two types of operations: CPU-bounded and IO-bounded.
+The specific system or configuration executing them drives whether the overall operation is
+CPU-bounded or IO-bounded. E.g. reading from s3 is usually IO-bounded, while reading from
+disk is usually CPU-bounded.
+
+For this reason, we separate IO-bounded APIs from CPU-bounded APIs. Users _may_ mix then in
+the same thread for simplicity, but the API must allow for e.g. a single producer (of blocks)
+multiple consumer pattern.
 
 ### Read, decompress and deserialize
 
-Read blocks is IO-bounded and benefits from reusing the same buffer across blocks. The `sync` version looks as follows (the `async` is very similar):
+The operation to bring avro into memory is composed by 3 main ops:
+
+1. Read the metadata (`R: Read -> Schema`) (IO-bounded)
+2. Read block to memory (`R: Read -> Vec<u8>`) (IO-bounded)
+3. decompress block (`Vec<u8> -> Vec<u8>`) (CPU-bounded)
+4. deserialize block (`Vec<u8> -> Vec<Value>`) (CPU-bounded)
+
+The `sync` version of 1.-2. looks as follows (the `async` is very similar, via `futures::AsyncRead`):
 
 ```rust
 /// Reads the avro metadata from `reader` into a [`Schema`], [`Codec`] and magic marker.
@@ -73,10 +156,15 @@ impl<'a, R: Read> FallibleStreamingIterator for BlockStreamIterator<'a, R> {
 }
 ```
 
-Decompression is CPU intensive and benefits from re-using its buffer. We declare a zero-cost abstraction to handle both cases:
+Decompression is CPU-bounded and benefits from re-using a buffer. We declare an abstraction to handle it:
 
 ```rust
-pub struct Decompressor<'a, R: Read>;
+pub struct Decompressor<'a, R: Read> {
+    blocks: BlockStreamIterator<'a, R>,
+    codec: Codec,
+    buf: (Vec<u8>, usize),
+    was_swapped: bool,
+}
 
 // streaming iterator so that we can re-use the buffer for other decompressions without re-allocations
 impl<'a, R: Read> FallibleStreamingIterator for Decompressor<'a, R> {
@@ -92,10 +180,10 @@ Deserialization is CPU intensive. Here is a proposal to write such an operation:
 /// Invariants:
 /// `ValueRef` is consistent with `schema`
 /// * `block.len() >=` `.len()` of the second item of the return type
-pub fn deserialize_item<'a>(
-    mut block: &'a [u8],
+fn deserialize_item<'a>(
+    mut block: &[u8],
     schema: &AvroSchema,
-) -> Result<(ValueRef<'a>, &'a [u8])> {
+) -> Result<(Value, &'a [u8])> {
     todo!("reads from block according to `schema`")
 }
 
@@ -103,15 +191,13 @@ pub fn deserialize_item<'a>(
 pub fn deserialize(
     mut block: &'a [u8],
     avro_schemas: &[AvroSchema],
-    rows: &mut [ValueRef<'a>],
+    rows: &mut [Value<'a>],
 ) -> Result<()> {
-    todo!("same as deserialize_item, but over all rows (rows.len()). Re-use `rows` to avoid re-allocs")
+    todo!("use deserialize_item, but over all rows (rows.len()). Re-use `rows` to avoid re-allocs")
 }
 ```
 
-
-
-
-
+Note that this operation commits to `Value`. Other in-memory formats need to write a
+deserializer to their own in-memory format. The `deserialize` would be a reference implementation (for `Value`).
 
 
