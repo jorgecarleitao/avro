@@ -121,7 +121,7 @@ multiple consumer pattern.
 
 ### Read, decompress and deserialize
 
-The operation to bring avro into memory is composed by 3 main ops:
+The operation to bring avro into memory is composed by 4 main ops:
 
 1. Read the metadata (`R: Read -> Schema`) (IO-bounded)
 2. Read block to memory (`R: Read -> Vec<u8>`) (IO-bounded)
@@ -156,7 +156,17 @@ impl<'a, R: Read> FallibleStreamingIterator for BlockStreamIterator<'a, R> {
 }
 ```
 
-Decompression is CPU-bounded and benefits from re-using a buffer. We declare an abstraction to handle it:
+##### Notes
+
+* The iterator must be a `StreamingIterator` (as opposed to an `Iterator`) because we want to
+  keep ownership of the internal buffer so that we can re-use on the next read. An iterator relinquishes ownership
+  of the item, which in our case would imply that we could not re-use it.
+* `FallibleStreamingIterator` because the `advance` may fail, when we can't read the block at all (e.g. networking)
+* It is possible to write an equivalent `async` version of this using `AsyncRead`
+
+#### Decompression
+
+Decompression is CPU-bounded and benefits from re-using an internal buffer. We declare an abstraction to handle it:
 
 ```rust
 pub struct Decompressor<'a, R: Read> {
@@ -172,6 +182,13 @@ impl<'a, R: Read> FallibleStreamingIterator for Decompressor<'a, R> {
     type Error = AvroError;
 }
 ```
+
+Like before, we use a streaming iterator so that we keep ownership of the buffer after `advance`. Note how `Decompressor`
+is built on top of `BlockStreamIterator`. This API is not useful for multi-threaded programs because it requires mixing IO-bounded from CPU-bounded.
+An equivalent API using `I: Iterator<(Vec<u8>, usize)>` is required for multi-threaded programs (that send blocks through a channel).
+The advantage of this API is that it allows re-using both buffers at the same time (via `std::mem::swap`). See [here](https://github.com/jorgecarleitao/arrow2/blob/main/src/io/avro/read/mod.rs#L146) for an example implementation that uses `swap` to achieve this behavior.
+
+#### Deserialize
 
 Deserialization is CPU intensive. Here is a proposal to write such an operation:
 
@@ -199,5 +216,8 @@ pub fn deserialize(
 
 Note that this operation commits to `Value`. Other in-memory formats need to write a
 deserializer to their own in-memory format. The `deserialize` would be a reference implementation (for `Value`).
+
+See [here](https://github.com/jorgecarleitao/arrow2/blob/main/src/io/avro/read/deserialize.rs#L1) for an implementation for the arrow format that
+bipasses `Value` directly to `arrow`.
 
 
